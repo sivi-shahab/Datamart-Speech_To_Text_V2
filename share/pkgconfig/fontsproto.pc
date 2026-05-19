@@ -1,0 +1,7 @@
+prefix=/data/api_insert_table
+includedir=${prefix}/include
+ 
+Name: FontsProto
+Description: Fonts extension headers
+Version: 2.1.3
+Cflags: -I${includedir}

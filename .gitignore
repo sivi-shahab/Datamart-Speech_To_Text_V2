@@ -1,0 +1,23 @@
+# --- Kredensial (jangan pernah di-commit) ---
+.env
+
+# --- Artefak Python ---
+__pycache__/
+*.py[cod]
+
+# --- Versi lama yang disimpan lokal ---
+app/main_old.py
+app/refresh_recording_tms_api_old.py
+app/refresh_recording_tms_api_11122025.py
+
+# --- Direktori conda environment (repo ini sekaligus prefix env /data/api_insert_table) ---
+bin
+conda-meta
+compiler_compat
+etc
+include
+lib
+man
+share
+ssl
+x86_64-conda-linux-gnu

@@ -1,9 +1,48 @@
-"""
-Usage:
-  python -m app.jobs.refresh_recording_tms_api --source-api http://localhost:8888
-  python -m app.jobs.refresh_recording_tms_api --source-api "etl-batch" --date-from 2025-09-01 --date-to 2025-09-30
+"""Batch ETL: mengisi ``dashboard.recording_tms_api`` dari history TMS + rekaman.
+
+Job ini menjodohkan history campaign telemarketing dengan metadata rekaman
+panggilan e-centrix, lalu menyimpan hasilnya sebagai baris siap-konsumsi. Baris
+yang dihasilkan dipakai downstream (mis. speech-to-text) yang mengambil antrean
+kerjanya lewat kolom ``status_data IS NULL``.
+
+Seluruh transformasi didorong ke database dalam **satu statement**
+``INSERT ... SELECT`` dengan lima CTE; Python hanya menyusun string SQL dan
+mengeksekusinya dalam satu transaksi.
+
+Alur transformasi::
+
+    hist  ──┐
+            ├─> hist_queque ──> joined ──> filter file_path ──> INSERT
+    queque ─┘                     ^
+                                  │
+    rec ──────────────────────────┘
+
+Penjodohan rekaman memakai dua strategi berjenjang dalam satu klausa ``OR``:
+bila nomor HP pelanggan tersedia di antrian dialer, rekaman dicocokkan lewat
+nomor telepon (``a_number = "handPhone1"``); bila tidak, jatuh kembali ke
+pencocokan berbasis ID (``recording_customer_id = prospect_id``).
+
+Job bersifat **idempotent** berkat ``ON CONFLICT (tiket_id, file_path) DO
+NOTHING``, sehingga aman dijalankan ulang untuk rentang tanggal yang sama.
+
+Usage::
+
+    cd app
+    python refresh_recording_tms_api.py --source-api http://localhost:8888
+    python refresh_recording_tms_api.py --source-api "etl-batch" \\
+        --date-from 2026-07-01 --date-to 2026-07-27
+
+Di produksi dijalankan lewat cron setiap hari pukul 20:20; ``cd`` ke direktori
+``app/`` bersifat wajib agar ``.env`` terbaca.
+
 Env:
-  PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DATABASE
+    DATABASE_URL -- URI SQLAlchemy lengkap, dibaca dari ``.env`` pada direktori
+        kerja saat proses dijalankan.
+
+Caveat:
+    CTE ``rec`` memakai jendela tetap ``CURRENT_DATE - INTERVAL '7 days'`` yang
+    **tidak** menyesuaikan ``--date-from``/``--date-to``. Menjalankan job untuk
+    tanggal di luar 7 hari terakhir tidak akan menemukan rekaman.
 """
 from datetime import date
 from typing import Optional
@@ -12,6 +51,16 @@ from sqlalchemy import create_engine, text
 import argparse, urllib.parse, sys
 
 class Settings(BaseSettings):
+    """Konfigurasi job, dibaca dari environment variable atau file ``.env``.
+
+    ``env_file='.env'`` bersifat relatif terhadap **current working directory**,
+    bukan terhadap lokasi file ini. Karena itu entri cron selalu melakukan
+    ``cd /data/api_insert_table/app`` sebelum menjalankan job.
+
+    Attributes:
+        DATABASE_URL: URI SQLAlchemy lengkap, mis.
+            ``postgresql+psycopg2://user:pass@host:5432/db``. Wajib ada.
+    """
     # Configure Pydantic to read settings from a .env file
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
     DATABASE_URL: str
@@ -29,6 +78,22 @@ TABLE_QUEQUE = '"manaf_acs_predictive_queue"'
 
 # ========= INSERT (append) - NOW USING F-STRING =========
 # Using f"""...""" to allow Python variables (like TABLE_HISTORY) to be injected.
+#
+# Peta CTE:
+#   hist        -- history yang closed-won: status = 4 AND last_response_reason = 'Agree',
+#                  ditambah filter tanggal opsional lewat placeholder /**DATE_RANGE**/.
+#   queque      -- antrian predictive dialer; berperan sebagai jembatan nomor telepon,
+#                  memetakan prospect_id -> "handPhone1".
+#   rec         -- rekaman 7 hari terakhir. ROW_NUMBER() dihitung per
+#                  (recording_customer_id, a_number), namun kolom rn TIDAK difilter di
+#                  query final -- seluruh rekaman yang cocok tetap ikut, sehingga satu
+#                  baris history dapat menghasilkan beberapa baris output (satu per file).
+#   hist_queque -- LEFT JOIN hist -> queque agar history tanpa padanan antrian tidak hilang.
+#   joined      -- LEFT JOIN ke rec dengan dua strategi berjenjang (nomor telepon dulu,
+#                  fallback ke ID pelanggan bila "handPhone1" NULL).
+#
+# tiket_id dibentuk deterministik sebagai <id>_<YYYYMMDDHH24MISS>; dipasangkan dengan
+# file_path, keduanya menjadi primary key tabel tujuan sekaligus target ON CONFLICT.
 
 
 INSERT_SQL = f"""
@@ -127,9 +192,30 @@ ON CONFLICT (tiket_id, file_path) DO NOTHING;
 
 
 def build_date_clause(date_from: Optional[date], date_to: Optional[date]) -> str:
-    """Builds the WHERE clause for date filtering."""
+    """Membangun fragmen filter tanggal untuk CTE ``hist``.
+
+    Memakai kolom tanggal ternormalisasi
+    ``COALESCE(h.created_time::date, to_date(h."MIS_DATE",'YYYYMMDD'))`` agar baris
+    history yang ``created_time``-nya kosong tetap dapat difilter lewat
+    ``"MIS_DATE"``.
+
+    Fragmen yang dikembalikan bersifat **statis** — nilai tanggalnya sendiri
+    dikirim terpisah sebagai bind parameter (``:date_from``, ``:date_to``) oleh
+    :func:`main`, sehingga tidak ada nilai input yang di-interpolasi ke SQL.
+
+    Args:
+        date_from: Batas bawah inklusif, atau ``None``.
+        date_to: Batas atas inklusif, atau ``None``.
+
+    Returns:
+        Fragmen ``AND ...`` sesuai kombinasi argumen; string kosong bila kedua
+        argumen ``None``.
+    """
     # Note: We use the normalized date column (COALESCE...) for filtering
-    normalized_date_col = "COALESCE(h.created_time::date, to_date(h.mis_date,'YYYYMMDD'))"
+    # Harus memakai nama kolom asli h."MIS_DATE" (huruf besar, dikutip), bukan alias
+    # keluaran `mis_date` dari CTE hist: fragmen ini disisipkan ke klausa WHERE pada
+    # SELECT yang sama, dan SQL tidak mengizinkan alias keluaran dipakai di WHERE.
+    normalized_date_col = """COALESCE(h.created_time::date, to_date(h."MIS_DATE",'YYYYMMDD'))"""
     
     if date_from and date_to:
         return f"AND {normalized_date_col} BETWEEN :date_from AND :date_to"
@@ -142,6 +228,35 @@ def build_date_clause(date_from: Optional[date], date_to: Optional[date]) -> str
 def main(source_api: str,
            date_from: Optional[date],
            date_to: Optional[date]) -> None:
+    """Menjalankan satu siklus ETL penuh dalam satu transaksi.
+
+    Langkah:
+        1. Muat konfigurasi dan buat engine (``pool_pre_ping=True`` agar koneksi
+           mati terdeteksi sebelum dipakai).
+        2. Bangun fragmen filter tanggal lewat :func:`build_date_clause`.
+        3. Substitusi fragmen tersebut ke placeholder ``/**DATE_RANGE**/`` pada
+           :data:`INSERT_SQL`.
+        4. Susun bind parameter, lalu eksekusi ``INSERT`` di dalam
+           ``engine.begin()`` sehingga otomatis commit bila sukses dan rollback
+           bila terjadi exception.
+
+    Args:
+        source_api: Label yang disimpan ke kolom ``source_api`` sebagai penanda
+            asal data. Nilai produksi berbentuk URL (``http://localhost:8888``),
+            namun job **tidak pernah** memanggil alamat tersebut — nilainya
+            murni sebagai teks penanda.
+        date_from: Batas bawah inklusif filter tanggal history, atau ``None``.
+        date_to: Batas atas inklusif filter tanggal history, atau ``None``.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: Bila koneksi atau eksekusi SQL gagal.
+            Transaksi otomatis di-rollback.
+
+    Note:
+        Jumlah baris yang benar-benar tersimpan tidak dilaporkan. Karena
+        ``ON CONFLICT DO NOTHING``, eksekusi ulang atas rentang yang sama akan
+        selesai normal tanpa menyisipkan baris baru.
+    """
     settings = Settings()
     engine = create_engine(settings.sqlalchemy_uri, pool_pre_ping=True, future=True)
 
@@ -180,3 +295,6 @@ if __name__ == "__main__":
         )
     except Exception as e:
         print(f"ERROR: Failed to run job: {e}", file=sys.stderr)
+        # Wajib: tanpa exit code non-nol, proses berakhir dengan status 0 dan cron
+        # akan menganggap job sukses meski transaksi gagal / di-rollback.
+        sys.exit(1)

@@ -1,4 +1,29 @@
 # app/main.py
+"""Read API: menyajikan gabungan history campaign TMS + rekaman panggilan e-centrix.
+
+Modul ini mengekspos satu endpoint (``GET /history-recording-flat``) yang
+menggabungkan dua tabel PostgreSQL menjadi struktur datar (satu baris per
+rekaman), tanpa menulis apa pun ke database.
+
+Strategi penggabungan sengaja **tidak memakai JOIN SQL**: history dan rekaman
+diambil lewat dua query terpisah, lalu dijodohkan di memori Python berdasarkan
+pasangan ``(prospect_id, created_date)``. Pilihan ini menghindari rencana
+eksekusi join yang mahal pada tabel berukuran besar.
+
+Perbedaan penting dengan ``refresh_recording_tms_api.py`` (batch job): modul ini
+menjodohkan rekaman lewat ``recording_customer_id`` dan membentuk ``tiket_id``
+dengan suffix ``_a``/``_b``, sedangkan batch job menjodohkan lewat nomor telepon
+dan membentuk ``tiket_id`` berpola ``<id>_<YYYYMMDDHH24MISS>``. Keduanya tidak
+menghasilkan ``tiket_id`` yang saling kompatibel.
+
+Menjalankan::
+
+    cd app && uvicorn main:app --host 0.0.0.0 --port 8888
+
+Environment:
+    DATABASE_URL -- URI SQLAlchemy lengkap, dibaca dari ``.env`` pada direktori
+        kerja saat proses dijalankan (bukan direktori file ini).
+"""
 from fastapi import FastAPI, Query
 from typing import List, Optional, Dict, Tuple
 from datetime import date
@@ -11,6 +36,28 @@ app = FastAPI(title="History -> Recording (flat, tiket_id with _a/_b) [PostgreSQ
 
 # ---------------- Settings (PostgreSQL) ----------------
 class Settings(BaseSettings):
+    """Konfigurasi aplikasi, dibaca dari environment variable atau file ``.env``.
+
+    ``env_file='.env'`` bersifat relatif terhadap **current working directory**,
+    sehingga proses harus dijalankan dari dalam direktori ``app/``.
+
+    Attributes:
+        DATABASE_URL: URI SQLAlchemy lengkap, mis.
+            ``postgresql+psycopg2://user:pass@host:5432/db``. Wajib ada —
+            aplikasi gagal saat import bila variabel ini tidak tersedia.
+        SCHEMA_HISTORY: Schema tabel history. Dapat dioverride lewat env var.
+        TABLE_HISTORY: Nama tabel history. Dapat dioverride lewat env var.
+        SCHEMA_RECORDING: Schema tabel rekaman. Dapat dioverride lewat env var.
+        TABLE_RECORDING: Nama tabel rekaman. Dapat dioverride lewat env var.
+
+    Note:
+        Nilai ``TABLE_HISTORY`` dan ``TABLE_RECORDING`` mengandung huruf besar.
+        PostgreSQL melipat identifier tak-berkutip menjadi huruf kecil, sehingga
+        template SQL di bawah **wajib** menyisipkannya di antara tanda kutip
+        ganda (``{schema}."{table}"``). Bila nilainya dioverride lewat
+        environment variable, tulis nama tabel **tanpa** kutip — kutip
+        ditambahkan oleh template.
+    """
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
     DATABASE_URL: str
     #PG_HOST: str
@@ -43,6 +90,12 @@ class Settings(BaseSettings):
     #     return f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}"
 
     def sqlalchemy_uri(self) -> str:
+        """URI koneksi yang dipakai ``create_engine``.
+
+        Meneruskan ``DATABASE_URL`` apa adanya. Varian lama yang menyusun URI
+        dari ``PG_HOST``/``PG_PORT``/``PG_USER``/``PG_PASSWORD``/``PG_DATABASE``
+        masih tersimpan sebagai komentar di atas.
+        """
         return self.DATABASE_URL
 
 settings = Settings()
@@ -50,6 +103,12 @@ engine = create_engine(settings.sqlalchemy_uri, pool_pre_ping=True, pool_recycle
 
 # ---------------- Schemas (response) ----------------
 class FlatRow(BaseModel):
+    """Satu baris hasil datar: kolom history + kolom rekaman digabung sejajar.
+
+    Seluruh field opsional karena satu baris history bisa saja tidak memiliki
+    rekaman pasangan — dalam kasus itu ``a_number``, ``context``, dan
+    ``file_path`` bernilai ``None``.
+    """
     # Tabel 1 (history)
     tiket_id: Optional[str] = None
     agent_id: Optional[str] = None
@@ -62,13 +121,23 @@ class FlatRow(BaseModel):
     file_path: Optional[str] = None
 
 class FlatResponse(BaseModel):
+    """Envelope response endpoint.
+
+    Attributes:
+        count: Jumlah elemen pada ``items``. Nilainya bisa **lebih besar** dari
+            parameter ``limit``, karena satu baris history dengan 2 rekaman
+            menghasilkan 2 baris output.
+        items: Daftar baris datar hasil penggabungan.
+    """
     count: int
     items: List[FlatRow]
 
 # ---------------- SQL templates (PostgreSQL dialect) ----------------
 # HISTORY (pakai kolom yang kamu minta + normalisasi waktu/tanggal)
-COALESCE_DATE = "COALESCE(h.created_time::date, to_date(h.mis_date,'YYYYMMDD'))"
-COALESCE_TS   = "COALESCE(h.created_time, to_timestamp(h.mis_date,'YYYYMMDD'))"
+# Identifier bertanda kutip ganda: nama kolom "MIS_DATE" memakai huruf besar di
+# PostgreSQL, sehingga tanpa kutip akan dilipat menjadi `mis_date` dan tidak ditemukan.
+COALESCE_DATE = """COALESCE(h.created_time::date, to_date(h."MIS_DATE",'YYYYMMDD'))"""
+COALESCE_TS   = """COALESCE(h.created_time, to_timestamp(h."MIS_DATE",'YYYYMMDD'))"""
 
 SQL_HISTORY = f"""
 SELECT
@@ -78,7 +147,7 @@ SELECT
     to_char({COALESCE_TS}, 'YYYY-MM-DD HH24:MI:SS.MS') AS created_time,
     {COALESCE_DATE} AS created_date,
     CAST(h.prospect_id AS VARCHAR(64)) AS prospect_id
-FROM {settings.SCHEMA_HISTORY}.{settings.TABLE_HISTORY} AS h
+FROM {settings.SCHEMA_HISTORY}."{settings.TABLE_HISTORY}" AS h
 WHERE h.status = 4
   /**DATE_FROM**/
   /**DATE_TO**/
@@ -87,6 +156,24 @@ LIMIT :limit;
 """
 
 def _build_history_sql(date_from: Optional[date], date_to: Optional[date]) -> str:
+    """Menyusun query history dengan filter tanggal yang bersifat opsional.
+
+    Placeholder berbentuk komentar SQL (``/**DATE_FROM**/``, ``/**DATE_TO**/``)
+    disubstitusi dengan fragmen ``AND ...`` bila argumen tanggal terisi, atau
+    dengan string kosong bila tidak. Karena penandanya berupa komentar, template
+    tetap valid secara sintaks meski tidak disubstitusi.
+
+    Yang disisipkan hanyalah **fragmen SQL statis** — nilai tanggalnya sendiri
+    tetap dikirim sebagai bind parameter (``:date_from``, ``:date_to``) oleh
+    pemanggil, sehingga pola ini tidak membuka celah SQL injection.
+
+    Args:
+        date_from: Batas bawah inklusif ``created_date``, atau ``None``.
+        date_to: Batas atas inklusif ``created_date``, atau ``None``.
+
+    Returns:
+        String SQL siap dieksekusi dengan ``sqlalchemy.text()``.
+    """
     sql = SQL_HISTORY
     if date_from:
         sql = sql.replace("/**DATE_FROM**/", f"AND {COALESCE_DATE} >= :date_from")
@@ -112,7 +199,7 @@ WITH rec AS (
         PARTITION BY r.recording_customer_id, r.created_time::date
         ORDER BY r.created_time DESC
       ) AS rn
-  FROM {settings.SCHEMA_RECORDING}.{settings.TABLE_RECORDING} AS r
+  FROM {settings.SCHEMA_RECORDING}."{settings.TABLE_RECORDING}" AS r
   WHERE r.recording_customer_id = ANY(:ids)
     AND r.created_time::date = ANY(:dt)
 )
@@ -128,6 +215,18 @@ WHERE rn <= 2;
 """
 
 def _chunk(lst, n):
+    """Memecah ``lst`` menjadi potongan berurutan berukuran maksimal ``n``.
+
+    Dipakai untuk membatasi panjang array parameter ``:ids`` pada query
+    RECORDING, agar tidak mengirim satu array raksasa ke PostgreSQL.
+
+    Args:
+        lst: Sequence yang akan dipecah.
+        n: Ukuran maksimum tiap potongan.
+
+    Yields:
+        Potongan list; potongan terakhir bisa lebih pendek dari ``n``.
+    """
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
@@ -148,6 +247,36 @@ def history_recording_flat(
         maka tiket paling baru: "<id>_a", dan yang kedua: "<id>_b".
       - Jika hanya 1 recording, pakai "<id>" tanpa suffix.
       - Jika tidak ada recording, tetap satu baris dengan kolom tabel 2 = null dan tiket_id = "<id>".
+
+    Alur eksekusi terdiri atas tiga langkah, seluruhnya dalam satu koneksi:
+
+    1. **HISTORY** -- ambil maksimal ``limit`` baris ber-``status = 4`` (nilai ini
+       di-hardcode di query, bukan parameter), diurutkan dari yang terbaru.
+       Bila kosong, langsung kembalikan response kosong.
+    2. **RECORDING** -- kumpulkan ``prospect_id`` dan ``created_date`` unik dari
+       hasil langkah 1, lalu ambil maksimal 2 rekaman terbaru per pasangan
+       ``(recording_customer_id, created_date)``. Query dijalankan per batch
+       ``prospect_id`` sebesar ``batch_size``; daftar tanggal (``:dt``) selalu
+       dikirim utuh dan tidak ikut dibatch.
+    3. **FLATTEN** -- jodohkan di memori memakai dictionary ``rec_map``, urutkan
+       rekaman dari yang terbaru, lalu bentuk ``tiket_id`` sesuai aturan di atas.
+
+    Args:
+        date_from: Batas bawah inklusif pada ``created_date``, yaitu
+            ``COALESCE(created_time::date, to_date(mis_date,'YYYYMMDD'))``.
+        date_to: Batas atas inklusif pada ``created_date``.
+        limit: Jumlah maksimum baris **HISTORY** yang diambil (1--10000).
+            Bukan batas jumlah baris response.
+        batch_size: Ukuran batch daftar ``prospect_id`` pada langkah 2
+            (50--2000). Parameter tuning; tidak mengubah isi hasil.
+
+    Returns:
+        FlatResponse: ``count`` beserta daftar ``items``.
+
+    Note:
+        Baris history yang ``prospect_id``- atau ``created_date``-nya kosong
+        tidak ikut dicarikan rekaman, namun tetap muncul di output dengan kolom
+        rekaman bernilai ``None``.
     """
     # ---- Step 1: HISTORY ----
     sql_hist = _build_history_sql(date_from, date_to)

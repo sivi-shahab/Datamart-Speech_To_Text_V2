@@ -1,7 +1,0 @@
-prefix=/data/api_insert_table
-includedir=${prefix}/include
- 
-Name: PresentProto
-Description: Present extension headers
-Version: 1.4
-Cflags: -I${includedir}

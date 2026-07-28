@@ -184,7 +184,11 @@ Pada `refresh_recording_tms_api.py`, nama tabel **di-hardcode** sebagai konstant
 
 ## Struktur folder
 
-Repo ini berada di `/data/api_insert_table`, yang **sekaligus merupakan prefix conda environment**. Akibatnya direktori standar conda (`bin/`, `lib/`, `include/`, `share/`, `conda-meta/`, `ssl/`, `etc/`, `man/`, `compiler_compat/`, `x86_64-conda-linux-gnu/`) ikut ter-*track* di git. Direktori-direktori tersebut **bukan bagian dari kode aplikasi**.
+Repo ini berada di `/data/api_insert_table`, yang **sekaligus merupakan prefix conda environment**. Direktori standar conda (`bin/`, `lib/`, `include/`, `share/`, `conda-meta/`, `ssl/`, `etc/`, `man/`, `compiler_compat/`, `x86_64-conda-linux-gnu/`) ikut berada di direktori ini namun **bukan bagian dari kode aplikasi**.
+
+Sebelumnya 10.892 file environment tersebut ter-*track* di git. Seluruhnya kini dikeluarkan dari version control (`git rm -r --cached`, file tetap ada di disk) dan sudah tercakup `.gitignore`, sehingga repo hanya melacak kode aplikasi dan dokumentasi. Environment-nya sendiri direproduksi lewat `requirements.txt`, bukan lewat git.
+
+> File environment masih tersimpan di history commit `6c5dba2`, jadi ukuran objek `.git` tidak ikut mengecil kecuali history ditulis ulang.
 
 Kode aplikasi yang relevan hanya sebagai berikut:
 

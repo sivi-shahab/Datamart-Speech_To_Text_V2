@@ -1,7 +1,0 @@
-prefix=/data/api_insert_table
-includedir=${prefix}/include
- 
-Name: RandrProto
-Description: Randr extension headers
-Version: 1.6.0
-Cflags: -I${includedir}

@@ -71,10 +71,12 @@ class Settings(BaseSettings):
       return self.DATABASE_URL
     
 # --- Table Names (Quoted for PostgreSQL Mixed-Case Sensitivity) ---
-# NOTE: These names MUST EXACTLY match the case in PostgreSQL.
+# #\NOTE: These names MUST EXACTLY match the case in PostgreSQL.
 TABLE_HISTORY = '"manaf_HISTORY_TMS_PROSPECT_DETAIL_CAMPAIGN"'
 TABLE_RECORDING = '"MANAF_ecentrix_recording"'
 TABLE_QUEQUE = '"manaf_acs_predictive_queue"'
+#TABLE_QUEQUE = '"manaf_acs_predictive_queue_11082026"'
+
 
 # ========= INSERT (append) - NOW USING F-STRING =========
 # Using f"""...""" to allow Python variables (like TABLE_HISTORY) to be injected.
@@ -95,25 +97,118 @@ TABLE_QUEQUE = '"manaf_acs_predictive_queue"'
 # tiket_id dibentuk deterministik sebagai <id>_<YYYYMMDDHH24MISS>; dipasangkan dengan
 # file_path, keduanya menjadi primary key tabel tujuan sekaligus target ON CONFLICT.
 
+#add h.customer_id, h.agent_id
+# INSERT_SQL = f"""
+# WITH hist AS (
+#   SELECT
+#     -- Menggunakan Kutip Ganda dan Huruf Besar untuk kolom yang sensitif case
+#     h."JULIAN_MIS_DATE" AS julian_mis_date, h."MIS_DATE" AS mis_date, h.id, h.prospect_id, 
+#     h.customer_id, h.cust_name, h.file_id, h.campaign, h.agent_id, h.max_transfer, 
+#     h.group_prospect, h.last_response_reason, h.last_response_sub_reason,
+#     h.first_contact_time, h.last_contact_time, h.last_contact_by, h.priority, h.qc_group, 
+#     h.qc_by, h.qc_status, h.qc_sub_status, h.qc_sub_sub_status, h.qc_pickup_time, h.qc_notes, 
+#     h.is_customer, h.is_response_agent, h.is_sync, h.is_upload_doc, h.file_document, 
+#     h.upload_by, h.notes, h.total_input, h.service_level, h.status, h.revision, 
+#     h.is_main_campaign, h.reff, h.seq_number, h.status_microsite, h.created_by, h.created_time
+#   FROM dashboard.{TABLE_HISTORY} h
+#   WHERE h.status = 4 AND h.last_response_reason = 'Agree' 
+#   /**DATE_RANGE**/
+# ),
+# queque AS (
+#   SELECT 
+#     id,
+#     contract_number,
+#     source,
+#     account_number,
+#     class_id,
+#     last_attempt_datetime,
+#     "handPhone1"
+#   FROM dashboard.{TABLE_QUEQUE}
+# ),
+# rec AS (
+#   SELECT
+#     r.recording_customer_id,
+#     r.created_time::date AS rec_created_date,
+#     r.created_time       AS rec_created_ts,
+#     r.a_number,
+#     r.context,
+#     r.file_path,
+#     ROW_NUMBER() OVER (
+#       PARTITION BY r.recording_customer_id, r.a_number
+#       ORDER BY r.created_time DESC
+#     ) AS rn
+#   FROM dashboard.{TABLE_RECORDING} r
+#   WHERE r.created_time >= CURRENT_DATE - INTERVAL '7 days'
+# ),
+# hist_queque AS (
+#   SELECT
+#     h.*,
+#     q.id AS queue_id,
+#     q.contract_number,
+#     q.source,
+#     q.account_number,
+#     q.class_id,
+#     q.last_attempt_datetime,
+#     q."handPhone1"
+#   FROM hist h
+#   LEFT JOIN queque q ON q.contract_number = h.prospect_id
+# ),
+# joined AS (
+#   SELECT
+#     hq.*,
+#     r.rec_created_ts AS recording_created_time,
+#     r.a_number,
+#     r.context,
+#     r.file_path,
+#     r.rn
+#   FROM hist_queque hq
+#   LEFT JOIN rec r
+#     ON (
+#       (hq."handPhone1" IS NOT NULL AND r.a_number = hq."handPhone1")
+#       OR
+#       (hq."handPhone1" IS NULL AND r.recording_customer_id = hq.prospect_id)
+#     )
+# )
+# INSERT INTO dashboard.recording_tms_api (
+#   tiket_id, file_path,
+#   julian_mis_date, mis_date, id, prospect_id, customer_id, cust_name,
+#   campaign, agent_id, status, created_by, created_time, created_date,
+#   recording_customer_id, recording_created_time, a_number, context,
+#   source_api, load_date, status_data, error_message
+# )
+# SELECT
+#   j.id || '_' || TO_CHAR(j.recording_created_time, 'YYYYMMDDHH24MISS') AS tiket_id,
+#   j.file_path,
+#   j.julian_mis_date, j.mis_date, j.id, j.prospect_id, j.customer_id, j.cust_name,
+#   j.campaign, j.agent_id, j.status, j.created_by,
+#   COALESCE((j.recording_created_time)::timestamp, to_timestamp(j.mis_date,'YYYYMMDD')) AS created_time,
+#   COALESCE((j.recording_created_time)::date,       to_date(j.mis_date,'YYYYMMDD'))      AS created_date,
+#   j.prospect_id                                           AS recording_customer_id,
+#   j.recording_created_time, j.a_number, j.context,
+#   :source_api, CURRENT_DATE, NULL, NULL
+# FROM joined j
+# WHERE j.file_path IS NOT NULL
+# order by id, recording_created_time
+# ON CONFLICT (tiket_id, file_path) DO NOTHING;
+# """
 
 INSERT_SQL = f"""
 WITH hist AS (
   SELECT
-    -- Menggunakan Kutip Ganda dan Huruf Besar untuk kolom yang sensitif case
-    h."JULIAN_MIS_DATE" AS julian_mis_date, h."MIS_DATE" AS mis_date, h.id, h.prospect_id, 
-    h.customer_id, h.cust_name, h.file_id, h.campaign, h.agent_id, h.max_transfer, 
+    h."JULIAN_MIS_DATE" AS julian_mis_date, h."MIS_DATE" AS mis_date, h.id, h.prospect_id,
+    h.customer_id, h.cust_name, h.file_id, h.campaign, h.agent_id, h.max_transfer,
     h.group_prospect, h.last_response_reason, h.last_response_sub_reason,
-    h.first_contact_time, h.last_contact_time, h.last_contact_by, h.priority, h.qc_group, 
-    h.qc_by, h.qc_status, h.qc_sub_status, h.qc_sub_sub_status, h.qc_pickup_time, h.qc_notes, 
-    h.is_customer, h.is_response_agent, h.is_sync, h.is_upload_doc, h.file_document, 
-    h.upload_by, h.notes, h.total_input, h.service_level, h.status, h.revision, 
+    h.first_contact_time, h.last_contact_time, h.last_contact_by, h.priority, h.qc_group,
+    h.qc_by, h.qc_status, h.qc_sub_status, h.qc_sub_sub_status, h.qc_pickup_time, h.qc_notes,
+    h.is_customer, h.is_response_agent, h.is_sync, h.is_upload_doc, h.file_document,
+    h.upload_by, h.notes, h.total_input, h.service_level, h.status, h.revision,
     h.is_main_campaign, h.reff, h.seq_number, h.status_microsite, h.created_by, h.created_time
   FROM dashboard.{TABLE_HISTORY} h
-  WHERE h.status = 4 AND h.last_response_reason = 'Agree' 
+  WHERE h.status = 4 AND h.last_response_reason = 'Agree'
   /**DATE_RANGE**/
 ),
 queque AS (
-  SELECT 
+  SELECT
     id,
     contract_number,
     source,
@@ -129,10 +224,11 @@ rec AS (
     r.created_time::date AS rec_created_date,
     r.created_time       AS rec_created_ts,
     r.a_number,
+    r.agent_id           AS rec_agent_id,
     r.context,
     r.file_path,
     ROW_NUMBER() OVER (
-      PARTITION BY r.recording_customer_id, r.a_number
+      PARTITION BY r.recording_customer_id, r.a_number, r.agent_id
       ORDER BY r.created_time DESC
     ) AS rn
   FROM dashboard.{TABLE_RECORDING} r
@@ -144,27 +240,30 @@ hist_queque AS (
     q.id AS queue_id,
     q.contract_number,
     q.source,
-    q.account_number,
+    q.account_number, 
     q.class_id,
     q.last_attempt_datetime,
     q."handPhone1"
   FROM hist h
-  LEFT JOIN queque q ON q.contract_number = h.prospect_id
+  LEFT JOIN queque q
+    ON  q.contract_number = h.prospect_id
+    AND q.account_number  = h.customer_id
 ),
 joined AS (
   SELECT
     hq.*,
     r.rec_created_ts AS recording_created_time,
     r.a_number,
+    r.rec_agent_id,
     r.context,
     r.file_path,
     r.rn
   FROM hist_queque hq
   LEFT JOIN rec r
-    ON (
-      (hq."handPhone1" IS NOT NULL AND r.a_number = hq."handPhone1")
-      OR
-      (hq."handPhone1" IS NULL AND r.recording_customer_id = hq.prospect_id)
+    ON  r.rec_agent_id = hq.agent_id
+    AND (
+          (hq."handPhone1" IS NOT NULL AND r.a_number = hq."handPhone1")
+        OR (hq."handPhone1" IS NULL AND r.recording_customer_id = hq.prospect_id)
     )
 )
 INSERT INTO dashboard.recording_tms_api (
@@ -186,7 +285,6 @@ SELECT
   :source_api, CURRENT_DATE, NULL, NULL
 FROM joined j
 WHERE j.file_path IS NOT NULL
-order by id, recording_created_time
 ON CONFLICT (tiket_id, file_path) DO NOTHING;
 """
 

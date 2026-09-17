@@ -1,270 +1,131 @@
-"""Batch ETL: mengisi ``dashboard.recording_tms_api`` dari history TMS + rekaman.
+"""Batch ETL harian: mengisi ``dashboard.recording_tms_api`` dari TMS prospect time frame + rekaman.
 
-Job ini menjodohkan history campaign telemarketing dengan metadata rekaman
-panggilan e-centrix, lalu menyimpan hasilnya sebagai baris siap-konsumsi. Baris
-yang dihasilkan dipakai downstream (mis. speech-to-text) yang mengambil antrean
-kerjanya lewat kolom ``status_data IS NULL``.
-
-Seluruh transformasi didorong ke database dalam **satu statement**
-``INSERT ... SELECT`` dengan lima CTE; Python hanya menyusun string SQL dan
-mengeksekusinya dalam satu transaksi.
+Job ini mengambil prospek berstatus Agree hari ini (CURRENT_DATE) dari
+``tms_prospect_time_frame``, menurunkan agent asli (bukan ``UPDATE BY MICROSITE``),
+lalu menjodohkannya dengan rekaman e-centrix hari ini berdasarkan agent + prospect_id.
+Baris hasil dipakai downstream (speech-to-text) lewat ``status_data IS NULL``.
 
 Alur transformasi::
 
-    hist  ──┐
-            ├─> hist_queque ──> joined ──> filter file_path ──> INSERT
-    queque ─┘                     ^
-                                  │
-    rec ──────────────────────────┘
+    base -> tagged -> grouped -> filled -> agree_only ─┐
+                                                        ├─> joined -> INSERT
+    recording (hari ini, durasi > 60 dtk, terbaru) ────┘
 
-Penjodohan rekaman memakai dua strategi berjenjang dalam satu klausa ``OR``:
-bila nomor HP pelanggan tersedia di antrian dialer, rekaman dicocokkan lewat
-nomor telepon (``a_number = "handPhone1"``); bila tidak, jatuh kembali ke
-pencocokan berbasis ID (``recording_customer_id = prospect_id``).
-
-Job bersifat **idempotent** berkat ``ON CONFLICT (tiket_id, file_path) DO
-NOTHING``, sehingga aman dijalankan ulang untuk rentang tanggal yang sama.
+Job bersifat idempotent berkat ``ON CONFLICT (tiket_id, file_path) DO NOTHING``.
 
 Usage::
 
     cd app
     python refresh_recording_tms_api.py --source-api http://localhost:8888
-    python refresh_recording_tms_api.py --source-api "etl-batch" \\
-        --date-from 2026-07-01 --date-to 2026-07-27
-
-Di produksi dijalankan lewat cron setiap hari pukul 20:20; ``cd`` ke direktori
-``app/`` bersifat wajib agar ``.env`` terbaca.
 
 Env:
-    DATABASE_URL -- URI SQLAlchemy lengkap, dibaca dari ``.env`` pada direktori
-        kerja saat proses dijalankan.
-
-Caveat:
-    CTE ``rec`` memakai jendela tetap ``CURRENT_DATE - INTERVAL '7 days'`` yang
-    **tidak** menyesuaikan ``--date-from``/``--date-to``. Menjalankan job untuk
-    tanggal di luar 7 hari terakhir tidak akan menemukan rekaman.
+    DATABASE_URL -- URI SQLAlchemy lengkap, dibaca dari ``.env`` di direktori kerja.
 """
-from datetime import date
-from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine, text
-import argparse, urllib.parse, sys
+import argparse
+import sys
+
 
 class Settings(BaseSettings):
-    """Konfigurasi job, dibaca dari environment variable atau file ``.env``.
-
-    ``env_file='.env'`` bersifat relatif terhadap **current working directory**,
-    bukan terhadap lokasi file ini. Karena itu entri cron selalu melakukan
-    ``cd /data/api_insert_table/app`` sebelum menjalankan job.
-
-    Attributes:
-        DATABASE_URL: URI SQLAlchemy lengkap, mis.
-            ``postgresql+psycopg2://user:pass@host:5432/db``. Wajib ada.
-    """
-    # Configure Pydantic to read settings from a .env file
-    model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
+    """Konfigurasi job dari environment variable atau ``.env`` (relatif ke CWD)."""
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
     DATABASE_URL: str
 
     @property
     def sqlalchemy_uri(self) -> str:
-      """Returns the configured database connection URI."""
-      return self.DATABASE_URL
-    
-# --- Table Names (Quoted for PostgreSQL Mixed-Case Sensitivity) ---
-# #\NOTE: These names MUST EXACTLY match the case in PostgreSQL.
-TABLE_HISTORY = '"manaf_HISTORY_TMS_PROSPECT_DETAIL_CAMPAIGN"'
-TABLE_RECORDING = '"MANAF_ecentrix_recording"'
-TABLE_QUEQUE = '"manaf_acs_predictive_queue"'
-#TABLE_QUEQUE = '"manaf_acs_predictive_queue_11082026"'
+        return self.DATABASE_URL
 
 
-# ========= INSERT (append) - NOW USING F-STRING =========
-# Using f"""...""" to allow Python variables (like TABLE_HISTORY) to be injected.
-#
-# Peta CTE:
-#   hist        -- history yang closed-won: status = 4 AND last_response_reason = 'Agree',
-#                  ditambah filter tanggal opsional lewat placeholder /**DATE_RANGE**/.
-#   queque      -- antrian predictive dialer; berperan sebagai jembatan nomor telepon,
-#                  memetakan prospect_id -> "handPhone1".
-#   rec         -- rekaman 7 hari terakhir. ROW_NUMBER() dihitung per
-#                  (recording_customer_id, a_number), namun kolom rn TIDAK difilter di
-#                  query final -- seluruh rekaman yang cocok tetap ikut, sehingga satu
-#                  baris history dapat menghasilkan beberapa baris output (satu per file).
-#   hist_queque -- LEFT JOIN hist -> queque agar history tanpa padanan antrian tidak hilang.
-#   joined      -- LEFT JOIN ke rec dengan dua strategi berjenjang (nomor telepon dulu,
-#                  fallback ke ID pelanggan bila "handPhone1" NULL).
-#
-# tiket_id dibentuk deterministik sebagai <id>_<YYYYMMDDHH24MISS>; dipasangkan dengan
-# file_path, keduanya menjadi primary key tabel tujuan sekaligus target ON CONFLICT.
+# --- Table Names (kutip bila nama tabel mixed-case di PostgreSQL) ---
+TABLE_TIME_FRAME = '"manaf_tms_prospect_time_frame"'
+TABLE_RECORDING  = '"MANAF_ecentrix_recording"'
+TABLE_CAMPAIGN   = '"tms_campaign"'
 
-#add h.customer_id, h.agent_id
-# INSERT_SQL = f"""
-# WITH hist AS (
-#   SELECT
-#     -- Menggunakan Kutip Ganda dan Huruf Besar untuk kolom yang sensitif case
-#     h."JULIAN_MIS_DATE" AS julian_mis_date, h."MIS_DATE" AS mis_date, h.id, h.prospect_id, 
-#     h.customer_id, h.cust_name, h.file_id, h.campaign, h.agent_id, h.max_transfer, 
-#     h.group_prospect, h.last_response_reason, h.last_response_sub_reason,
-#     h.first_contact_time, h.last_contact_time, h.last_contact_by, h.priority, h.qc_group, 
-#     h.qc_by, h.qc_status, h.qc_sub_status, h.qc_sub_sub_status, h.qc_pickup_time, h.qc_notes, 
-#     h.is_customer, h.is_response_agent, h.is_sync, h.is_upload_doc, h.file_document, 
-#     h.upload_by, h.notes, h.total_input, h.service_level, h.status, h.revision, 
-#     h.is_main_campaign, h.reff, h.seq_number, h.status_microsite, h.created_by, h.created_time
-#   FROM dashboard.{TABLE_HISTORY} h
-#   WHERE h.status = 4 AND h.last_response_reason = 'Agree' 
-#   /**DATE_RANGE**/
-# ),
-# queque AS (
-#   SELECT 
-#     id,
-#     contract_number,
-#     source,
-#     account_number,
-#     class_id,
-#     last_attempt_datetime,
-#     "handPhone1"
-#   FROM dashboard.{TABLE_QUEQUE}
-# ),
-# rec AS (
-#   SELECT
-#     r.recording_customer_id,
-#     r.created_time::date AS rec_created_date,
-#     r.created_time       AS rec_created_ts,
-#     r.a_number,
-#     r.context,
-#     r.file_path,
-#     ROW_NUMBER() OVER (
-#       PARTITION BY r.recording_customer_id, r.a_number
-#       ORDER BY r.created_time DESC
-#     ) AS rn
-#   FROM dashboard.{TABLE_RECORDING} r
-#   WHERE r.created_time >= CURRENT_DATE - INTERVAL '7 days'
-# ),
-# hist_queque AS (
-#   SELECT
-#     h.*,
-#     q.id AS queue_id,
-#     q.contract_number,
-#     q.source,
-#     q.account_number,
-#     q.class_id,
-#     q.last_attempt_datetime,
-#     q."handPhone1"
-#   FROM hist h
-#   LEFT JOIN queque q ON q.contract_number = h.prospect_id
-# ),
-# joined AS (
-#   SELECT
-#     hq.*,
-#     r.rec_created_ts AS recording_created_time,
-#     r.a_number,
-#     r.context,
-#     r.file_path,
-#     r.rn
-#   FROM hist_queque hq
-#   LEFT JOIN rec r
-#     ON (
-#       (hq."handPhone1" IS NOT NULL AND r.a_number = hq."handPhone1")
-#       OR
-#       (hq."handPhone1" IS NULL AND r.recording_customer_id = hq.prospect_id)
-#     )
-# )
-# INSERT INTO dashboard.recording_tms_api (
-#   tiket_id, file_path,
-#   julian_mis_date, mis_date, id, prospect_id, customer_id, cust_name,
-#   campaign, agent_id, status, created_by, created_time, created_date,
-#   recording_customer_id, recording_created_time, a_number, context,
-#   source_api, load_date, status_data, error_message
-# )
-# SELECT
-#   j.id || '_' || TO_CHAR(j.recording_created_time, 'YYYYMMDDHH24MISS') AS tiket_id,
-#   j.file_path,
-#   j.julian_mis_date, j.mis_date, j.id, j.prospect_id, j.customer_id, j.cust_name,
-#   j.campaign, j.agent_id, j.status, j.created_by,
-#   COALESCE((j.recording_created_time)::timestamp, to_timestamp(j.mis_date,'YYYYMMDD')) AS created_time,
-#   COALESCE((j.recording_created_time)::date,       to_date(j.mis_date,'YYYYMMDD'))      AS created_date,
-#   j.prospect_id                                           AS recording_customer_id,
-#   j.recording_created_time, j.a_number, j.context,
-#   :source_api, CURRENT_DATE, NULL, NULL
-# FROM joined j
-# WHERE j.file_path IS NOT NULL
-# order by id, recording_created_time
-# ON CONFLICT (tiket_id, file_path) DO NOTHING;
-# """
 
 INSERT_SQL = f"""
-WITH hist AS (
-  SELECT
-    h."JULIAN_MIS_DATE" AS julian_mis_date, h."MIS_DATE" AS mis_date, h.id, h.prospect_id,
-    h.customer_id, h.cust_name, h.file_id, h.campaign, h.agent_id, h.max_transfer,
-    h.group_prospect, h.last_response_reason, h.last_response_sub_reason,
-    h.first_contact_time, h.last_contact_time, h.last_contact_by, h.priority, h.qc_group,
-    h.qc_by, h.qc_status, h.qc_sub_status, h.qc_sub_sub_status, h.qc_pickup_time, h.qc_notes,
-    h.is_customer, h.is_response_agent, h.is_sync, h.is_upload_doc, h.file_document,
-    h.upload_by, h.notes, h.total_input, h.service_level, h.status, h.revision,
-    h.is_main_campaign, h.reff, h.seq_number, h.status_microsite, h.created_by, h.created_time
-  FROM dashboard.{TABLE_HISTORY} h
-  WHERE h.status = 4 AND h.last_response_reason = 'Agree'
-  /**DATE_RANGE**/
+WITH base AS (
+    SELECT
+        a.id,
+        a.prospect_id,
+        a.customer_id,
+        a.campaign          AS campaign_code,
+        a.agent_id_raw,
+        a.created_time_raw,
+        a.status
+    FROM dashboard.{TABLE_TIME_FRAME} a
+    WHERE a.created_time_raw >= CURRENT_DATE - INTERVAL '1 day'
+      AND a.created_time_raw <  CURRENT_DATE
 ),
-queque AS (
-  SELECT
-    id,
-    contract_number,
-    source,
-    account_number,
-    class_id,
-    last_attempt_datetime,
-    "handPhone1"
-  FROM dashboard.{TABLE_QUEQUE}
+tagged AS (
+    SELECT *,
+        CASE WHEN agent_id_raw <> 'UPDATE BY MICROSITE' THEN 1 ELSE 0 END AS is_real_agent
+    FROM base
 ),
-rec AS (
-  SELECT
-    r.recording_customer_id,
-    r.created_time::date AS rec_created_date,
-    r.created_time       AS rec_created_ts,
-    r.a_number,
-    r.agent_id           AS rec_agent_id,
-    r.context,
-    r.file_path,
-    ROW_NUMBER() OVER (
-      PARTITION BY r.recording_customer_id, r.a_number, r.agent_id
-      ORDER BY r.created_time DESC
-    ) AS rn
-  FROM dashboard.{TABLE_RECORDING} r
-  WHERE r.created_time >= CURRENT_DATE - INTERVAL '7 days'
+grouped AS (
+    SELECT *,
+        SUM(is_real_agent) OVER (
+            PARTITION BY id ORDER BY created_time_raw ROWS UNBOUNDED PRECEDING
+        ) AS grp
+    FROM tagged
 ),
-hist_queque AS (
-  SELECT
-    h.*,
-    q.id AS queue_id,
-    q.contract_number,
-    q.source,
-    q.account_number, 
-    q.class_id,
-    q.last_attempt_datetime,
-    q."handPhone1"
-  FROM hist h
-  LEFT JOIN queque q
-    ON  q.contract_number = h.prospect_id
-    AND q.account_number  = h.customer_id
+filled AS (
+    SELECT *,
+        MAX(CASE WHEN is_real_agent = 1 THEN agent_id_raw END)
+            OVER (PARTITION BY id, grp) AS agent_id,
+        MAX(CASE WHEN is_real_agent = 1 THEN created_time_raw END)
+            OVER (PARTITION BY id, grp) AS last_contact_time
+    FROM grouped
+),
+agree_only AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY id, prospect_id ORDER BY created_time_raw ASC
+        ) AS rn
+    FROM filled
+    WHERE status = 'Agree'
+      AND agent_id IS NOT NULL
+),
+recording AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY recording_customer_id, rec_agent_id
+            ORDER BY rec_created_ts DESC
+        ) AS rn_rec
+    FROM (
+        SELECT r.recording_customer_id,
+               r.created_time AS rec_created_ts,
+               r.a_number,
+               r.agent_id     AS rec_agent_id,
+               r.file_path
+        FROM dashboard.{TABLE_RECORDING} r
+        WHERE r.duration > 60
+          AND r.file_path IS NOT NULL
+    ) sub
 ),
 joined AS (
-  SELECT
-    hq.*,
-    r.rec_created_ts AS recording_created_time,
-    r.a_number,
-    r.rec_agent_id,
-    r.context,
-    r.file_path,
-    r.rn
-  FROM hist_queque hq
-  LEFT JOIN rec r
-    ON  r.rec_agent_id = hq.agent_id
-    AND (
-          (hq."handPhone1" IS NOT NULL AND r.a_number = hq."handPhone1")
-        OR (hq."handPhone1" IS NULL AND r.recording_customer_id = hq.prospect_id)
-    )
+    SELECT
+        TO_CHAR(a.last_contact_time, 'YYYYDDD')  AS julian_mis_date,
+        TO_CHAR(a.last_contact_time, 'YYYYMMDD') AS mis_date,
+        a.id,
+        a.prospect_id,
+        a.customer_id,
+        NULL::text                               AS cust_name,
+        b.name                                   AS campaign,
+        a.agent_id,
+        a.agent_id_raw                           AS created_by,
+        r.rec_created_ts                         AS recording_created_time,
+        r.a_number,
+        a.campaign_code                          AS context,
+        r.file_path
+    FROM agree_only a
+    LEFT JOIN dashboard.{TABLE_CAMPAIGN} b
+           ON b.code = a.campaign_code
+    JOIN recording r
+           ON r.rec_agent_id          = a.agent_id
+          AND r.recording_customer_id = a.prospect_id
+          AND r.rn_rec = 1
+    WHERE a.rn = 1
 )
 INSERT INTO dashboard.recording_tms_api (
   tiket_id, file_path,
@@ -277,10 +138,12 @@ SELECT
   j.id || '_' || TO_CHAR(j.recording_created_time, 'YYYYMMDDHH24MISS') AS tiket_id,
   j.file_path,
   j.julian_mis_date, j.mis_date, j.id, j.prospect_id, j.customer_id, j.cust_name,
-  j.campaign, j.agent_id, j.status, j.created_by,
-  COALESCE((j.recording_created_time)::timestamp, to_timestamp(j.mis_date,'YYYYMMDD')) AS created_time,
-  COALESCE((j.recording_created_time)::date,       to_date(j.mis_date,'YYYYMMDD'))      AS created_date,
-  j.prospect_id                                           AS recording_customer_id,
+  j.campaign, j.agent_id,
+  NULL                                                                  AS status,
+  j.created_by,
+  COALESCE(j.recording_created_time::timestamp, to_timestamp(j.mis_date, 'YYYYMMDD')) AS created_time,
+  COALESCE(j.recording_created_time::date,      to_date(j.mis_date, 'YYYYMMDD'))      AS created_date,
+  j.prospect_id                                                         AS recording_customer_id,
   j.recording_created_time, j.a_number, j.context,
   :source_api, CURRENT_DATE, NULL, NULL
 FROM joined j
@@ -288,111 +151,26 @@ WHERE j.file_path IS NOT NULL
 ON CONFLICT (tiket_id, file_path) DO NOTHING;
 """
 
-
-def build_date_clause(date_from: Optional[date], date_to: Optional[date]) -> str:
-    """Membangun fragmen filter tanggal untuk CTE ``hist``.
-
-    Memakai kolom tanggal ternormalisasi
-    ``COALESCE(h.created_time::date, to_date(h."MIS_DATE",'YYYYMMDD'))`` agar baris
-    history yang ``created_time``-nya kosong tetap dapat difilter lewat
-    ``"MIS_DATE"``.
-
-    Fragmen yang dikembalikan bersifat **statis** — nilai tanggalnya sendiri
-    dikirim terpisah sebagai bind parameter (``:date_from``, ``:date_to``) oleh
-    :func:`main`, sehingga tidak ada nilai input yang di-interpolasi ke SQL.
-
-    Args:
-        date_from: Batas bawah inklusif, atau ``None``.
-        date_to: Batas atas inklusif, atau ``None``.
-
-    Returns:
-        Fragmen ``AND ...`` sesuai kombinasi argumen; string kosong bila kedua
-        argumen ``None``.
-    """
-    # Note: We use the normalized date column (COALESCE...) for filtering
-    # Harus memakai nama kolom asli h."MIS_DATE" (huruf besar, dikutip), bukan alias
-    # keluaran `mis_date` dari CTE hist: fragmen ini disisipkan ke klausa WHERE pada
-    # SELECT yang sama, dan SQL tidak mengizinkan alias keluaran dipakai di WHERE.
-    normalized_date_col = """COALESCE(h.created_time::date, to_date(h."MIS_DATE",'YYYYMMDD'))"""
-    
-    if date_from and date_to:
-        return f"AND {normalized_date_col} BETWEEN :date_from AND :date_to"
-    if date_from:
-        return f"AND {normalized_date_col} >= :date_from"
-    if date_to:
-        return f"AND {normalized_date_col} <= :date_to"
-    return ""
-
-def main(source_api: str,
-           date_from: Optional[date],
-           date_to: Optional[date]) -> None:
-    """Menjalankan satu siklus ETL penuh dalam satu transaksi.
-
-    Langkah:
-        1. Muat konfigurasi dan buat engine (``pool_pre_ping=True`` agar koneksi
-           mati terdeteksi sebelum dipakai).
-        2. Bangun fragmen filter tanggal lewat :func:`build_date_clause`.
-        3. Substitusi fragmen tersebut ke placeholder ``/**DATE_RANGE**/`` pada
-           :data:`INSERT_SQL`.
-        4. Susun bind parameter, lalu eksekusi ``INSERT`` di dalam
-           ``engine.begin()`` sehingga otomatis commit bila sukses dan rollback
-           bila terjadi exception.
-
-    Args:
-        source_api: Label yang disimpan ke kolom ``source_api`` sebagai penanda
-            asal data. Nilai produksi berbentuk URL (``http://localhost:8888``),
-            namun job **tidak pernah** memanggil alamat tersebut — nilainya
-            murni sebagai teks penanda.
-        date_from: Batas bawah inklusif filter tanggal history, atau ``None``.
-        date_to: Batas atas inklusif filter tanggal history, atau ``None``.
-
-    Raises:
-        sqlalchemy.exc.SQLAlchemyError: Bila koneksi atau eksekusi SQL gagal.
-            Transaksi otomatis di-rollback.
-
-    Note:
-        Jumlah baris yang benar-benar tersimpan tidak dilaporkan. Karena
-        ``ON CONFLICT DO NOTHING``, eksekusi ulang atas rentang yang sama akan
-        selesai normal tanpa menyisipkan baris baru.
-    """
+def main(source_api: str) -> None:
+    """Menjalankan satu siklus ETL harian dalam satu transaksi (commit/rollback otomatis)."""
     settings = Settings()
     engine = create_engine(settings.sqlalchemy_uri, pool_pre_ping=True, future=True)
 
-    params = {"source_api": source_api}
-    
-    # 1. Build the dynamic date filtering clause
-    date_clause = build_date_clause(date_from, date_to)
-    
-    # 2. Inject the date filtering into the SQL string
-    sql = INSERT_SQL.replace("/**DATE_RANGE**/", f"\n  {date_clause}\n" if date_clause else "")
-
-    # 3. Add date parameters if needed
-    if date_from:
-        params["date_from"] = date_from.isoformat()
-    if date_to:
-        params["date_to"]  = date_to.isoformat()
-
-    # 4. Execute the SQL transaction
     with engine.begin() as conn:
-        conn.execute(text(sql), params)
+        result = conn.execute(text(INSERT_SQL), {"source_api": source_api})
+        inserted = result.rowcount
 
-    print("refresh_recording_tms_api: INSERT done (ON CONFLICT DO NOTHING).")
+    print(f"refresh_recording_tms_api: CURRENT_DATE, inserted {inserted} row(s) (ON CONFLICT DO NOTHING).")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source-api", required=True, help="Tag sumber untuk kolom source_api (mis. http://localhost:8888 atau nama job)")
-    ap.add_argument("--date-from", type=lambda s: date.fromisoformat(s), help="YYYY-MM-DD")
-    ap.add_argument("--date-to",   type=lambda s: date.fromisoformat(s), help="YYYY-MM-DD")
+    ap.add_argument("--source-api", required=True,
+                    help="Tag sumber untuk kolom source_api (mis. http://localhost:8888 atau nama job)")
     args = ap.parse_args()
 
     try:
-        main(
-            source_api=args.source_api,
-            date_from=args.date_from,
-            date_to=args.date_to,
-        )
+        main(source_api=args.source_api)
     except Exception as e:
         print(f"ERROR: Failed to run job: {e}", file=sys.stderr)
-        # Wajib: tanpa exit code non-nol, proses berakhir dengan status 0 dan cron
-        # akan menganggap job sukses meski transaksi gagal / di-rollback.
-        sys.exit(1)
+        sys.exit(1)  # wajib non-nol agar cron tidak menganggap sukses

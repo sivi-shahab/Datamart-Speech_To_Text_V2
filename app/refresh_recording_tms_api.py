@@ -1,30 +1,56 @@
-"""Batch ETL harian: mengisi ``dashboard.recording_tms_api`` dari TMS prospect time frame + rekaman.
+"""Batch ETL: mengisi ``dashboard.recording_tms_api`` dari TMS prospect time frame + rekaman.
 
-Job ini mengambil prospek berstatus Agree hari ini (CURRENT_DATE) dari
-``tms_prospect_time_frame``, menurunkan agent asli (bukan ``UPDATE BY MICROSITE``),
-lalu menjodohkannya dengan rekaman e-centrix hari ini berdasarkan agent + prospect_id.
+Job ini mengambil prospek berstatus Agree dalam rentang tanggal tertentu (default:
+kemarin + hari ini) dari ``tms_prospect_time_frame`` (replika ecentrix), menentukan
+agent yang berhak atas Agree tersebut, lalu menjodohkannya dengan rekaman e-centrix.
 Baris hasil dipakai downstream (speech-to-text) lewat ``status_data IS NULL``.
+
+Aturan bisnis:
+    1. Agree terakhir per ticket_id + campaign_id dalam rentang tanggal.
+    2. Jika Agree dicatat oleh ``UPDATE BY MICROSITE``, agent_id diisi dengan agent
+       terakhir (group_id = 'Agent Tele Test') yang menghubungi ticket + campaign
+       yang sama sebelum waktu Agree, tanpa batas tanggal dan apa pun statusnya.
+    3. Recording diambil dari agent tersebut untuk nasabah yang sama, durasi > 60 detik,
+       dalam 7 hari kalender ke belakang dari tanggal Agree s/d akhir hari Agree.
+       Semua recording yang memenuhi syarat dimasukkan (satu baris per recording).
 
 Alur transformasi::
 
-    base -> tagged -> grouped -> filled -> agree_only ─┐
-                                                        ├─> joined -> INSERT
-    recording (hari ini, durasi > 60 dtk, terbaru) ────┘
+    base -> filled -> agree_only ─┐
+                                   ├─> joined -> INSERT
+    recording (H-7 s/d hari Agree, durasi > 60 dtk) ┘
 
-Job bersifat idempotent berkat ``ON CONFLICT (tiket_id, file_path) DO NOTHING``.
+Job bersifat idempotent berkat ``ON CONFLICT (tiket_id, file_path) DO NOTHING``,
+sehingga aman dijalankan berulang kali (mis. tiap jam).
 
 Usage::
 
     cd app
+    # default: Agree kemarin + hari ini
     python refresh_recording_tms_api.py --source-api http://localhost:8888
+
+    # backfill rentang tertentu (end-date eksklusif)
+    python refresh_recording_tms_api.py --source-api http://localhost:8888 \\
+        --start-date 2026-10-02 --end-date 2026-10-03
 
 Env:
     DATABASE_URL -- URI SQLAlchemy lengkap, dibaca dari ``.env`` di direktori kerja.
+
+Index yang disarankan (dibuat sekali)::
+
+    CREATE INDEX IF NOT EXISTS idx_tf_ticket_campaign_time
+        ON dashboard."manaf_tms_prospect_time_frame" (ticket_id, campaign_id, created_time DESC);
+    CREATE INDEX IF NOT EXISTS idx_rec_cust_agent_time
+        ON dashboard."MANAF_ecentrix_recording" (recording_customer_id, agent_id, created_time DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_recording_tms_api_tiket_file
+        ON dashboard.recording_tms_api (tiket_id, file_path);
 """
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import create_engine, text
+from datetime import date, timedelta
 import argparse
 import sys
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import create_engine, text
 
 
 class Settings(BaseSettings):
@@ -42,68 +68,56 @@ TABLE_TIME_FRAME = '"manaf_tms_prospect_time_frame"'
 TABLE_RECORDING  = '"MANAF_ecentrix_recording"'
 TABLE_CAMPAIGN   = '"tms_campaign"'
 
+# --- Business rules ---
+MICROSITE_AGENT   = "UPDATE BY MICROSITE"
+AGENT_GROUP       = "Agent Tele Test"
+MIN_DURATION_SEC  = 60
+RECORDING_LOOKBACK_DAYS = 7
+
 
 INSERT_SQL = f"""
-WITH base AS (
-    SELECT
-        a.id,
+WITH base AS (                                   -- Agree terakhir per ticket + campaign
+    SELECT DISTINCT ON (a.ticket_id, a.campaign_id)
+        a.ticket_id      AS id,
         a.prospect_id,
         a.customer_id,
-        a.campaign          AS campaign_code,
-        a.agent_id_raw,
-        a.created_time_raw,
-        a.status
+        a.campaign_id    AS campaign_code,
+        a.created_by     AS agent_id_raw,
+        a.created_time   AS created_time_raw
     FROM dashboard.{TABLE_TIME_FRAME} a
-    WHERE a.created_time_raw >= CURRENT_DATE - INTERVAL '1 day'
-      AND a.created_time_raw <  CURRENT_DATE
+    WHERE a.created_time >= :start_date
+      AND a.created_time <  :end_date
+      AND a.response_status = 'Agree'
+    ORDER BY a.ticket_id, a.campaign_id, a.created_time DESC
 ),
-tagged AS (
-    SELECT *,
-        CASE WHEN agent_id_raw <> 'UPDATE BY MICROSITE' THEN 1 ELSE 0 END AS is_real_agent
-    FROM base
-),
-grouped AS (
-    SELECT *,
-        SUM(is_real_agent) OVER (
-            PARTITION BY id ORDER BY created_time_raw ROWS UNBOUNDED PRECEDING
-        ) AS grp
-    FROM tagged
-),
-filled AS (
-    SELECT *,
-        MAX(CASE WHEN is_real_agent = 1 THEN agent_id_raw END)
-            OVER (PARTITION BY id, grp) AS agent_id,
-        MAX(CASE WHEN is_real_agent = 1 THEN created_time_raw END)
-            OVER (PARTITION BY id, grp) AS last_contact_time
-    FROM grouped
+filled AS (                                      -- microsite -> agent terakhir di grup agent
+    SELECT
+        b.*,
+        CASE WHEN b.agent_id_raw = '{MICROSITE_AGENT}'
+             THEN h.created_by   ELSE b.agent_id_raw     END AS agent_id,
+        CASE WHEN b.agent_id_raw = '{MICROSITE_AGENT}'
+             THEN h.created_time ELSE b.created_time_raw END AS last_contact_time
+    FROM base b
+    LEFT JOIN LATERAL (
+        SELECT x.created_by, x.created_time
+        FROM dashboard.{TABLE_TIME_FRAME} x
+        WHERE b.agent_id_raw = '{MICROSITE_AGENT}'
+          AND x.ticket_id   = b.id
+          AND x.campaign_id = b.campaign_code
+          AND x.group_id    = '{AGENT_GROUP}'
+          AND x.created_by IS NOT NULL
+          AND x.created_by <> '{MICROSITE_AGENT}'
+          AND x.created_time < b.created_time_raw
+        ORDER BY x.created_time DESC
+        LIMIT 1
+    ) h ON TRUE
 ),
 agree_only AS (
-    SELECT *,
-        ROW_NUMBER() OVER (
-            PARTITION BY id, prospect_id ORDER BY created_time_raw ASC
-        ) AS rn
+    SELECT *
     FROM filled
-    WHERE status = 'Agree'
-      AND agent_id IS NOT NULL
+    WHERE agent_id IS NOT NULL
 ),
-recording AS (
-    SELECT *,
-        ROW_NUMBER() OVER (
-            PARTITION BY recording_customer_id, rec_agent_id
-            ORDER BY rec_created_ts DESC
-        ) AS rn_rec
-    FROM (
-        SELECT r.recording_customer_id,
-               r.created_time AS rec_created_ts,
-               r.a_number,
-               r.agent_id     AS rec_agent_id,
-               r.file_path
-        FROM dashboard.{TABLE_RECORDING} r
-        WHERE r.duration > 60
-          AND r.file_path IS NOT NULL
-    ) sub
-),
-joined AS (
+joined AS (                                      -- semua recording H-7 s/d hari Agree, > 1 menit
     SELECT
         TO_CHAR(a.last_contact_time, 'YYYYDDD')  AS julian_mis_date,
         TO_CHAR(a.last_contact_time, 'YYYYMMDD') AS mis_date,
@@ -111,21 +125,23 @@ joined AS (
         a.prospect_id,
         a.customer_id,
         NULL::text                               AS cust_name,
-        b.name                                   AS campaign,
+        c.name                                   AS campaign,
         a.agent_id,
         a.agent_id_raw                           AS created_by,
-        r.rec_created_ts                         AS recording_created_time,
-        r.a_number,
+        rr.created_time                          AS recording_created_time,
+        rr.a_number,
         a.campaign_code                          AS context,
-        r.file_path
+        rr.file_path
     FROM agree_only a
-    LEFT JOIN dashboard.{TABLE_CAMPAIGN} b
-           ON b.code = a.campaign_code
-    JOIN recording r
-           ON r.rec_agent_id          = a.agent_id
-          AND r.recording_customer_id = a.prospect_id
-          AND r.rn_rec = 1
-    WHERE a.rn = 1
+    LEFT JOIN dashboard.{TABLE_CAMPAIGN} c
+           ON c.code = a.campaign_code
+    JOIN dashboard.{TABLE_RECORDING} rr
+           ON rr.recording_customer_id = a.prospect_id
+          AND rr.agent_id      = a.agent_id
+          AND rr.duration      > {MIN_DURATION_SEC}
+          AND rr.file_path IS NOT NULL
+          AND rr.created_time >= a.created_time_raw::date - INTERVAL '{RECORDING_LOOKBACK_DAYS} days'
+          AND rr.created_time <  a.created_time_raw::date + INTERVAL '1 day'
 )
 INSERT INTO dashboard.recording_tms_api (
   tiket_id, file_path,
@@ -147,30 +163,46 @@ SELECT
   j.recording_created_time, j.a_number, j.context,
   :source_api, CURRENT_DATE, NULL, NULL
 FROM joined j
-WHERE j.file_path IS NOT NULL
 ON CONFLICT (tiket_id, file_path) DO NOTHING;
 """
 
-def main(source_api: str) -> None:
-    """Menjalankan satu siklus ETL harian dalam satu transaksi (commit/rollback otomatis)."""
+
+def main(source_api: str, start_date: date, end_date: date) -> None:
+    """Menjalankan satu siklus ETL dalam satu transaksi (commit/rollback otomatis)."""
+    if end_date <= start_date:
+        raise ValueError(f"end_date ({end_date}) harus lebih besar dari start_date ({start_date})")
+
     settings = Settings()
     engine = create_engine(settings.sqlalchemy_uri, pool_pre_ping=True, future=True)
 
     with engine.begin() as conn:
-        result = conn.execute(text(INSERT_SQL), {"source_api": source_api})
+        result = conn.execute(text(INSERT_SQL), {
+            "start_date": start_date,
+            "end_date":   end_date,
+            "source_api": source_api,
+        })
         inserted = result.rowcount
 
-    print(f"refresh_recording_tms_api: CURRENT_DATE, inserted {inserted} row(s) (ON CONFLICT DO NOTHING).")
+    print(
+        f"refresh_recording_tms_api: Agree {start_date} s/d {end_date - timedelta(days=1)}, "
+        f"inserted {inserted} row(s) (ON CONFLICT DO NOTHING)."
+    )
 
 
 if __name__ == "__main__":
+    today = date.today()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--source-api", required=True,
                     help="Tag sumber untuk kolom source_api (mis. http://localhost:8888 atau nama job)")
+    ap.add_argument("--start-date", type=date.fromisoformat, default=today - timedelta(days=1),
+                    help="Tanggal awal Agree, inklusif (YYYY-MM-DD). Default: kemarin")
+    ap.add_argument("--end-date", type=date.fromisoformat, default=today + timedelta(days=1),
+                    help="Tanggal akhir Agree, eksklusif (YYYY-MM-DD). Default: besok (hari ini ikut)")
     args = ap.parse_args()
 
     try:
-        main(source_api=args.source_api)
+        main(source_api=args.source_api, start_date=args.start_date, end_date=args.end_date)
     except Exception as e:
         print(f"ERROR: Failed to run job: {e}", file=sys.stderr)
         sys.exit(1)  # wajib non-nol agar cron tidak menganggap sukses
